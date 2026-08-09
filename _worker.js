@@ -1,4 +1,4 @@
-// _worker.js - PellaFree 自动续期 + 重启脚本
+// _worker.js - PellaFree 自动续期 + 隧道异常自动重启面板
 
 export default {
   async fetch(request, env, ctx) {
@@ -6,12 +6,14 @@ export default {
     const password = url.searchParams.get('pwd') || url.searchParams.get('password');
     const correctPassword = env.PASSWORD || 'pella123';
 
+    // 1. 渲染前端面板
     if (url.pathname === '/' && !password) {
       return new Response(generateHTML(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
     }
 
+    // 2. 触发续期任务
     if (url.pathname === '/' || url.pathname === '/run') {
       if (password !== correctPassword) {
         return jsonResponse({ success: false, message: '访问密码错误' }, 401);
@@ -20,15 +22,14 @@ export default {
       return jsonResponse({ success: true, message: 'PellaFree 续期任务已触发，请查看 Telegram 通知' });
     }
 
+    // 3. 触发重启任务
     if (url.pathname === '/restart') {
       if (password !== correctPassword) {
         return jsonResponse({ success: false, message: '访问密码错误' }, 401);
       }
       const targetAccount = url.searchParams.get('account') || null;
       ctx.waitUntil(safeRun(() => main(env, 'restart', targetAccount)));
-      const msg = targetAccount
-        ? `重启任务已触发，目标账号: ${targetAccount}`
-        : '重启任务已触发，目标: 所有账号';
+      const msg = targetAccount ? `重启任务已触发，目标账号: ${targetAccount}` : '重启任务已触发，目标: 所有账号';
       return jsonResponse({ success: true, message: msg });
     }
 
@@ -36,22 +37,71 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(safeRun(() => main(env, 'renew')));
+    ctx.waitUntil(safeRun(async () => {
+      // 智能分流机制：通过识别 Cron 表达式执行不同任务
+      
+      // 1. 执行自动续期（只有在凌晨 01:30，或旧版未传递 cron 表达式时执行）
+      if (!event.cron || event.cron === "30 1 * * *") {
+        console.log("触发每日自动续期任务");
+        await main(env, 'renew');
+      }
+
+      // 2. 执行隧道监控与异常重启（每次 Cron 触发都检查）
+      if (env.ARGO_DOMAIN) {
+        await checkAndAutoRestart(env);
+      }
+    }));
   }
 };
 
 async function safeRun(fn) {
-  try {
-    await fn();
-  } catch (error) {
-    console.error('顶层执行异常:', error);
+  try { await fn(); } catch (error) { console.error('顶层执行异常:', error); }
+}
+
+// ==================== 隧道监控与自动重启 ====================
+async function checkAndAutoRestart(env) {
+  console.log("开始检测隧道状态...");
+  const domainStr = env.ARGO_DOMAIN.trim();
+  if (!domainStr) return;
+
+  const domains = domainStr.split(',').map(d => d.trim()).filter(Boolean);
+  let hasError = false;
+  let failedDomains = [];
+
+  for (const domain of domains) {
+    try {
+      const response = await fetch(`https://${domain}`, {
+        method: 'GET',
+        redirect: 'manual',
+        cf: { cacheTtl: 0 }
+      });
+      // 只要返回 200~499 (含 404 等) 都认为 Argo 隧道在工作，5xx 代表网关/隧道断联
+      const isOnline = response.status >= 200 && response.status < 500;
+      if (!isOnline) {
+        hasError = true;
+        failedDomains.push(domain);
+      }
+    } catch (e) {
+      hasError = true;
+      failedDomains.push(domain);
+    }
+  }
+
+  if (hasError) {
+    console.log(`检测到隧道异常: ${failedDomains.join(', ')}，触发自动重启...`);
+    if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
+      await sendTG(env, `⚠️ 隧道异常自动重启\n\n🌐 异常域名: ${failedDomains.join(', ')}\n🔄 正在通过底层 API 触发全账号重启...\n\nPellaFree Monitor`);
+    }
+    // 直接调用脚本内部的主函数执行全账号重启
+    await main(env, 'restart', null); 
+  } else {
+    console.log('隧道状态检测正常。');
   }
 }
 
 // ==================== 主入口 ====================
 async function main(env, mode = 'renew', targetAccount = null) {
   console.log(`开始执行 PellaFree ${mode === 'renew' ? '自动续期' : '重启'}...`);
-
   const accounts = parseAccounts(env.ACCOUNT);
   if (accounts.length === 0) {
     console.log('未找到有效账号');
@@ -61,10 +111,7 @@ async function main(env, mode = 'renew', targetAccount = null) {
     return;
   }
 
-  const targetAccounts = targetAccount
-    ? accounts.filter(a => a.email.toLowerCase() === targetAccount.toLowerCase())
-    : accounts;
-
+  const targetAccounts = targetAccount ? accounts.filter(a => a.email.toLowerCase() === targetAccount.toLowerCase()) : accounts;
   if (targetAccounts.length === 0 && targetAccount) {
     if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
       await sendTG(env, `⚠️ PellaFree ${mode === 'renew' ? '续期' : '重启'}\n\n未找到账号: ${targetAccount}\n请检查 ACCOUNT 变量\n\nPellaFree Auto Renewal`);
@@ -76,15 +123,10 @@ async function main(env, mode = 'renew', targetAccount = null) {
   for (let i = 0; i < targetAccounts.length; i += batchSize) {
     const batch = targetAccounts.slice(i, i + batchSize);
     console.log(`处理第 ${Math.floor(i / batchSize) + 1} 批，共 ${batch.length} 个账号`);
-
     const tasks = batch.map(account => processOneAccount(account, mode, env));
     await Promise.all(tasks);
-
-    if (i + batchSize < targetAccounts.length) {
-      await delay(1000);
-    }
+    if (i + batchSize < targetAccounts.length) await delay(1000);
   }
-
   console.log(`${mode === 'renew' ? '续期' : '重启'}任务完成`);
 }
 
@@ -131,18 +173,12 @@ async function processAccountRenew(account) {
 
   const beforeState = {};
   for (const server of servers) {
-    beforeState[server.id] = {
-      expiry: server.expiry,
-      status: server.status,
-      ip: server.ip
-    };
+    beforeState[server.id] = { expiry: server.expiry, status: server.status, ip: server.ip };
   }
 
   const renewResults = [];
   for (const server of servers) {
     console.log(`\n处理服务器 ${server.id} (IP: ${server.ip})`);
-
-    // 步骤1: 调用 renew/update 刷新广告链接
     console.log(`调用 renew/update 刷新广告链接...`);
     try {
       const updateResp = await fetch(`https://api.pella.app/server/renew/update?id=${server.id}`, {
@@ -164,7 +200,6 @@ async function processAccountRenew(account) {
 
     await delay(800);
 
-    // 步骤2: 获取刷新后的服务器详情
     let renewLinks = [];
     try {
       const detailResp = await fetch(`https://api.pella.app/server/detailed?id=${server.id}`, {
@@ -180,10 +215,6 @@ async function processAccountRenew(account) {
       const detailData = await detailResp.json();
       renewLinks = detailData.renew_links || [];
       console.log(`获取到 ${renewLinks.length} 个续期链接`);
-      
-      for (const link of renewLinks) {
-        console.log(`  链接: ${link.link}, claimed: ${link.claimed}, reward: ${link.reward}h`);
-      }
     } catch (e) {
       console.error(`获取详情失败:`, e.message);
       renewLinks = server.renew_links || [];
@@ -194,31 +225,24 @@ async function processAccountRenew(account) {
       continue;
     }
 
-    // 步骤3: 优先使用未领取的链接
     const availableLinks = renewLinks.filter(l => l.claimed === false);
     const linksToTry = availableLinks.length > 0 ? availableLinks : renewLinks;
-    
     console.log(`可用链接: ${availableLinks.length}, 将尝试: ${linksToTry.length}`);
 
-    let hasSuccess = false;
-    let hasFail = false;
-    let claimedCount = 0;
-    let successCount = 0;
+    let hasSuccess = false, hasFail = false;
+    let claimedCount = 0, successCount = 0;
     const failMessages = [];
 
     for (let i = 0; i < linksToTry.length; i++) {
       const linkObj = linksToTry[i];
       const linkUrl = typeof linkObj === 'string' ? linkObj : (linkObj.link || linkObj);
-
       console.log(`尝试链接 ${i + 1}/${linksToTry.length}: ${linkUrl}`);
       try {
         const result = await renewServer(authData.token, server.id, linkUrl);
         console.log(`结果: ${result.message}`);
-
         if (result.success) {
           hasSuccess = true;
           successCount++;
-          // 不再 break，继续尝试剩余链接
         } else if (result.alreadyClaimed) {
           claimedCount++;
         } else {
@@ -235,9 +259,7 @@ async function processAccountRenew(account) {
 
     if (hasSuccess) {
       renewResults.push({ serverId: server.id, status: 'success', message: `续期成功(${successCount}/${linksToTry.length})` });
-    } else if (claimedCount === linksToTry.length) {
-      renewResults.push({ serverId: server.id, status: 'claimed', message: '广告冷却中' });
-    } else if (claimedCount > 0 && !hasFail) {
+    } else if (claimedCount === linksToTry.length || (claimedCount > 0 && !hasFail)) {
       renewResults.push({ serverId: server.id, status: 'claimed', message: '广告冷却中' });
     } else if (hasFail) {
       renewResults.push({ serverId: server.id, status: 'fail', message: failMessages.join('; ') });
@@ -257,13 +279,7 @@ async function processAccountRenew(account) {
     error: null,
     servers: servers.map(s => {
       const before = beforeState[s.id] || {};
-      return {
-        id: s.id,
-        ip: s.ip || before.ip,
-        status: s.status,
-        expiry: s.expiry,
-        beforeExpiry: before.expiry
-      };
+      return { id: s.id, ip: s.ip || before.ip, status: s.status, expiry: s.expiry, beforeExpiry: before.expiry };
     }),
     renewResults,
     restartResults: []
@@ -306,12 +322,7 @@ async function processAccountRestart(account) {
     email: account.email,
     mode: 'restart',
     error: null,
-    servers: servers.map(s => ({
-      id: s.id,
-      ip: s.ip,
-      status: s.status,
-      expiry: s.expiry
-    })),
+    servers: servers.map(s => ({ id: s.id, ip: s.ip, status: s.status, expiry: s.expiry })),
     renewResults: [],
     restartResults
   };
@@ -321,7 +332,6 @@ async function processAccountRestart(account) {
 function formatNotification(result, mode) {
   const lines = [];
   const now = new Date();
-
   if (mode === 'renew') {
     lines.push('📋 PellaFree 续期报告');
   } else {
@@ -344,7 +354,6 @@ function formatNotification(result, mode) {
       for (const server of result.servers) {
         const statusText = server.status === 'running' ? '运行中' : (server.status === 'stopped' ? '已关机' : server.status || '未知');
         lines.push(`${statusText} | IP: ${server.ip || 'N/A'}`);
-
         const afterRemaining = calcRemaining(server.expiry, now);
         if (server.beforeExpiry && server.beforeExpiry !== server.expiry) {
           const beforeRemaining = calcRemaining(server.beforeExpiry, now);
@@ -353,7 +362,6 @@ function formatNotification(result, mode) {
           lines.push(`剩余: ${afterRemaining}`);
         }
       }
-
       const successResults = result.renewResults.filter(r => r.status === 'success');
       const claimedResults = result.renewResults.filter(r => r.status === 'claimed');
       const failResults = result.renewResults.filter(r => r.status === 'fail');
@@ -392,7 +400,6 @@ function formatNotification(result, mode) {
 
   lines.push('');
   lines.push('PellaFree Auto Renewal');
-
   return lines.join('\n');
 }
 
@@ -414,7 +421,6 @@ async function sendTG(env, text) {
 // ==================== 重启 API ====================
 async function redeployServer(token, serverId) {
   const bodyParams = new URLSearchParams({ id: serverId });
-
   const response = await fetch('https://api.pella.app/server/redeploy', {
     method: 'POST',
     headers: {
@@ -430,24 +436,18 @@ async function redeployServer(token, serverId) {
   if (!response.ok) {
     return { success: false, message: `HTTP异常 ${response.status}` };
   }
-
   const responseText = await response.text();
-
-  // 空响应视为成功
   if (!responseText) {
     return { success: true, message: '重启指令已发送' };
   }
-
   try {
     const data = JSON.parse(responseText);
-    // 多种成功判断
     if (data.success || data.message === 'success' || response.status === 200) {
       return { success: true, message: '重启指令已发送' };
     }
     if (data.error) return { success: false, message: data.error };
     return { success: false, message: '未知响应' };
   } catch {
-    // JSON解析失败但HTTP状态码200，视为成功
     return { success: true, message: '重启指令已发送' };
   }
 }
@@ -468,10 +468,9 @@ async function renewServer(token, serverId, renewLink) {
     },
     body: '{}'
   });
-
   const responseText = await response.text();
   console.log(`续期API响应: ${response.status} ${responseText}`);
-  
+
   let data;
   try {
     data = JSON.parse(responseText);
@@ -504,7 +503,6 @@ function parseAccounts(accountStr) {
 async function login(email, password) {
   const CLERK_API_VERSION = '2025-11-10';
   const CLERK_JS_VERSION = '5.125.3';
-
   const signInResponse = await fetch(`https://clerk.pella.app/v1/client/sign_ins?__clerk_api_version=${CLERK_API_VERSION}&_clerk_js_version=${CLERK_JS_VERSION}`, {
     method: 'POST',
     headers: {
@@ -517,10 +515,8 @@ async function login(email, password) {
   });
 
   if (!signInResponse.ok) {
-    const errorText = await signInResponse.text().catch(() => '');
     throw new Error(`登录失败: HTTP ${signInResponse.status}`);
   }
-
   const signInData = await signInResponse.json();
   let sessionId = signInData.response?.created_session_id;
   let token = null;
@@ -530,10 +526,8 @@ async function login(email, password) {
     sessionId = sessionId || session.id;
     token = session.last_active_token?.jwt;
   }
-
   const cookies = signInResponse.headers.get('set-cookie') || '';
   const clientCookie = extractCookie(cookies, '__client');
-
   if (token) return { token, sessionId, clientCookie };
 
   if (sessionId) {
@@ -548,7 +542,6 @@ async function login(email, password) {
       },
       body: 'active_organization_id='
     });
-
     if (touchResponse.ok) {
       const touchData = await touchResponse.json();
       token = touchData.sessions?.[0]?.last_active_token?.jwt || touchData.last_active_token?.jwt;
@@ -567,7 +560,6 @@ async function login(email, password) {
       },
       body: ''
     });
-
     if (tokensResponse.ok) {
       const tokensData = await tokensResponse.json();
       token = tokensData.jwt;
@@ -589,7 +581,6 @@ async function getServers(token) {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
   });
-
   if (!response.ok) throw new Error(`获取服务器列表失败: ${response.status}`);
   const data = await response.json();
   return data.servers || [];
@@ -626,9 +617,7 @@ function extractCookie(cookieHeader, name) {
   return match ? match[1] : null;
 }
 
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -673,62 +662,62 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </head>
 <body>
 <div class="container">
-  <div class="logo">
-    <h1>🚀 PellaFree</h1>
-    <p>自动续期 & 重启管理面板</p>
-  </div>
-  <div class="input-group">
-    <label>🔑 访问密码</label>
-    <input type="password" id="pwd" placeholder="请输入密码" autocomplete="off">
-  </div>
-  <div class="divider"></div>
-  <div class="section-title">续期操作</div>
-  <div class="btn-group">
-    <button class="btn btn-renew" onclick="doAction('renew')">📋 执行续期</button>
-  </div>
-  <div class="divider"></div>
-  <div class="section-title">重启操作</div>
-  <div class="input-group">
-    <label>📧 指定账号（留空则重启所有）</label>
-    <input type="text" id="account" placeholder="user@example.com（可选）">
-  </div>
-  <div class="btn-group">
-    <button class="btn btn-restart" onclick="doAction('restart')">🔄 执行重启</button>
-  </div>
-  <div class="result" id="result"></div>
+<div class="logo">
+<h1>🚀 PellaFree</h1>
+<p>自动续期 & 重启管理面板</p>
+</div>
+<div class="input-group">
+<label>🔑 访问密码</label>
+<input type="password" id="pwd" placeholder="请输入密码" autocomplete="off">
+</div>
+<div class="divider"></div>
+<div class="section-title">续期操作</div>
+<div class="btn-group">
+<button class="btn btn-renew" onclick="doAction('renew')">📋 执行续期</button>
+</div>
+<div class="divider"></div>
+<div class="section-title">重启操作</div>
+<div class="input-group">
+<label>📧 指定账号（留空则重启所有）</label>
+<input type="text" id="account" placeholder="user@example.com（可选）">
+</div>
+<div class="btn-group">
+<button class="btn btn-restart" onclick="doAction('restart')">🔄 执行重启</button>
+</div>
+<div class="result" id="result"></div>
 </div>
 <script>
 async function doAction(mode){
-  const pwd=document.getElementById('pwd').value.trim();
-  if(!pwd){showResult('请输入访问密码',false);return}
-  const btns=document.querySelectorAll('.btn');
-  btns.forEach(b=>b.disabled=true);
-  let url='';
-  if(mode==='renew'){
-    url='/?pwd='+encodeURIComponent(pwd);
-  }else{
-    const account=document.getElementById('account').value.trim();
-    url='/restart?pwd='+encodeURIComponent(pwd);
-    if(account)url+='&account='+encodeURIComponent(account);
-  }
-  try{
-    const res=await fetch(url);
-    const data=await res.json();
-    showResult(data.message,data.success);
-  }catch(e){
-    showResult('请求失败: '+e.message,false);
-  }finally{
-    btns.forEach(b=>b.disabled=false);
-  }
+const pwd=document.getElementById('pwd').value.trim();
+if(!pwd){showResult('请输入访问密码',false);return}
+const btns=document.querySelectorAll('.btn');
+btns.forEach(b=>b.disabled=true);
+let url='';
+if(mode==='renew'){
+url='/?pwd='+encodeURIComponent(pwd);
+}else{
+const account=document.getElementById('account').value.trim();
+url='/restart?pwd='+encodeURIComponent(pwd);
+if(account)url+='&account='+encodeURIComponent(account);
+}
+try{
+const res=await fetch(url);
+const data=await res.json();
+showResult(data.message,data.success);
+}catch(e){
+showResult('请求失败: '+e.message,false);
+}finally{
+btns.forEach(b=>b.disabled=false);
+}
 }
 function showResult(msg,success){
-  const el=document.getElementById('result');
-  el.textContent=msg;
-  el.className='result '+(success?'success':'error');
-  el.style.display='block';
+const el=document.getElementById('result');
+el.textContent=msg;
+el.className='result '+(success?'success':'error');
+el.style.display='block';
 }
 document.getElementById('pwd').addEventListener('keydown',function(e){
-  if(e.key==='Enter')doAction('renew');
+if(e.key==='Enter')doAction('renew');
 });
 </script>
 </body>
