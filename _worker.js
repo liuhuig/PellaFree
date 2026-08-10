@@ -38,11 +38,11 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(safeRun(async () => {
-      // 智能分流机制：通过识别 Cron 表达式执行不同任务
+      const schedule = getScheduleInfo();
       
-      // 1. 执行自动续期（只有在凌晨 01:30，或旧版未传递 cron 表达式时执行）
-      if (!event.cron || event.cron === "30 1 * * *") {
-        console.log("触发每日自动续期任务");
+      // 1. 执行自动续期（当到达每天顺延5分钟的计算时间窗口时执行）
+      if (schedule.isRenewTime) {
+        console.log(`到达动态续期时间: ${schedule.todayTimeStr}，触发自动续期任务`);
         await main(env, 'renew');
       }
 
@@ -56,6 +56,43 @@ export default {
 
 async function safeRun(fn) {
   try { await fn(); } catch (error) { console.error('顶层执行异常:', error); }
+}
+
+// ==================== 动态时间计算 ====================
+function getScheduleInfo() {
+  // 每次周期：24小时 + 5分钟 (毫秒)
+  const CYCLE_MS = 86700000; 
+  // 固定的基准时间偏移，确保初始执行时间大约在 01:30 (UTC+8) 左右
+  const OFFSET = 61800000; 
+  const nowMs = Date.now();
+
+  // 计算已经过了多少个完整的周期
+  const elapsedCycles = Math.floor((nowMs - OFFSET) / CYCLE_MS);
+  
+  // 当前周期的目标执行时间（今天）
+  const currentTargetMs = OFFSET + elapsedCycles * CYCLE_MS;
+  // 下个周期的目标执行时间（明天）
+  const nextTargetMs = currentTargetMs + CYCLE_MS;
+
+  // 允许 Cron 有极小误差，判定窗口为 [-1分钟, +5分钟]
+  const diffMs = nowMs - currentTargetMs;
+  const isRenewTime = diffMs > -60000 && diffMs < 300000;
+
+  // 格式化为北京时间 (UTC+8) MM-DD HH:mm
+  const formatTime = (ms) => {
+    const d = new Date(ms + 8 * 60 * 60 * 1000);
+    const mo = (d.getUTCMonth() + 1).toString().padStart(2, '0');
+    const day = d.getUTCDate().toString().padStart(2, '0');
+    const h = d.getUTCHours().toString().padStart(2, '0');
+    const m = d.getUTCMinutes().toString().padStart(2, '0');
+    return `${mo}-${day} ${h}:${m}`;
+  };
+
+  return {
+    isRenewTime,
+    todayTimeStr: formatTime(currentTargetMs),
+    tomorrowTimeStr: formatTime(nextTargetMs)
+  };
 }
 
 // ==================== 隧道监控与自动重启 ====================
@@ -75,7 +112,6 @@ async function checkAndAutoRestart(env) {
         redirect: 'manual',
         cf: { cacheTtl: 0 }
       });
-      // 只要返回 200~499 (含 404 等) 都认为 Argo 隧道在工作，5xx 代表网关/隧道断联
       const isOnline = response.status >= 200 && response.status < 500;
       if (!isOnline) {
         hasError = true;
@@ -92,7 +128,6 @@ async function checkAndAutoRestart(env) {
     if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
       await sendTG(env, `⚠️ 隧道异常自动重启\n\n🌐 异常域名: ${failedDomains.join(', ')}\n🔄 正在通过底层 API 触发全账号重启...\n\nPellaFree Monitor`);
     }
-    // 直接调用脚本内部的主函数执行全账号重启
     await main(env, 'restart', null); 
   } else {
     console.log('隧道状态检测正常。');
@@ -102,7 +137,9 @@ async function checkAndAutoRestart(env) {
 // ==================== 主入口 ====================
 async function main(env, mode = 'renew', targetAccount = null) {
   console.log(`开始执行 PellaFree ${mode === 'renew' ? '自动续期' : '重启'}...`);
+  const schedule = getScheduleInfo(); 
   const accounts = parseAccounts(env.ACCOUNT);
+  
   if (accounts.length === 0) {
     console.log('未找到有效账号');
     if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
@@ -123,7 +160,7 @@ async function main(env, mode = 'renew', targetAccount = null) {
   for (let i = 0; i < targetAccounts.length; i += batchSize) {
     const batch = targetAccounts.slice(i, i + batchSize);
     console.log(`处理第 ${Math.floor(i / batchSize) + 1} 批，共 ${batch.length} 个账号`);
-    const tasks = batch.map(account => processOneAccount(account, mode, env));
+    const tasks = batch.map(account => processOneAccount(account, mode, env, schedule));
     await Promise.all(tasks);
     if (i + batchSize < targetAccounts.length) await delay(1000);
   }
@@ -131,7 +168,7 @@ async function main(env, mode = 'renew', targetAccount = null) {
 }
 
 // ==================== 单账号处理 ====================
-async function processOneAccount(account, mode, env) {
+async function processOneAccount(account, mode, env, schedule) {
   console.log(`处理账号: ${account.email}`);
   let result;
   try {
@@ -154,7 +191,7 @@ async function processOneAccount(account, mode, env) {
 
   if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
     try {
-      const message = formatNotification(result, mode);
+      const message = formatNotification(result, mode, schedule);
       await sendTG(env, message);
     } catch (tgError) {
       console.error('Telegram 通知发送失败:', tgError);
@@ -329,15 +366,24 @@ async function processAccountRestart(account) {
 }
 
 // ==================== 通知格式 ====================
-function formatNotification(result, mode) {
+function formatNotification(result, mode, schedule) {
   const lines = [];
   const now = new Date();
+  
   if (mode === 'renew') {
     lines.push('📋 PellaFree 续期报告');
   } else {
     lines.push('🔄 PellaFree 重启报告');
   }
   lines.push('');
+
+  // 新增的定时时间通知模块
+  if (mode === 'renew' && schedule) {
+    lines.push(`🕒 本次计划: ${schedule.todayTimeStr}`);
+    lines.push(`🕒 下次计划: ${schedule.tomorrowTimeStr}`);
+    lines.push('');
+  }
+
   lines.push(`账号: ${escapeHtml(result.email)}`);
 
   if (result.error) {
