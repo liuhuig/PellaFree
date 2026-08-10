@@ -63,19 +63,19 @@ async function safeRun(fn) {
 function getScheduleInfo(env) {
   // 每次周期：24小时 + 5分钟 (毫秒)
   const CYCLE_MS = 86700000; 
-  // 默认基准时间戳: 2024-01-01 01:30:00 (UTC+8) -> 兼容未设置变量的情况
+  // 默认基准时间戳兜底 (如果未设置变量)
   let anchorMs = 1704043800000; 
 
   if (env && env.START_TIME) {
     try {
-      // 期望格式: "2024-08-10 01:30" 
-      // 替换空格为T并加上东八区时区，变成 ISO 8601 格式 "2024-08-10T01:30:00+08:00"
+      // 期望格式: "2026-08-10 01:30" (24小时制)
+      // 替换空格为T并加上东八区时区，变成 ISO 8601 格式 "2026-08-10T01:30:00+08:00"
       const timeStr = env.START_TIME.trim().replace(/\s+/, 'T') + ':00+08:00';
       const parsed = Date.parse(timeStr);
       if (!isNaN(parsed)) {
         anchorMs = parsed;
       } else {
-        console.error("START_TIME 变量格式解析失败，请检查是否为 YYYY-MM-DD HH:mm 格式");
+        console.error("START_TIME 变量格式解析失败，请检查是否为 YYYY-MM-DD HH:mm (24小时制) 格式");
       }
     } catch (e) {
       console.error("START_TIME 解析异常", e);
