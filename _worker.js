@@ -38,7 +38,8 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(safeRun(async () => {
-      const schedule = getScheduleInfo();
+      // 传入 env 以读取 START_TIME 变量
+      const schedule = getScheduleInfo(env); 
       
       // 1. 执行自动续期（当到达每天顺延5分钟的计算时间窗口时执行）
       if (schedule.isRenewTime) {
@@ -59,19 +60,36 @@ async function safeRun(fn) {
 }
 
 // ==================== 动态时间计算 ====================
-function getScheduleInfo() {
+function getScheduleInfo(env) {
   // 每次周期：24小时 + 5分钟 (毫秒)
   const CYCLE_MS = 86700000; 
-  // 固定的基准时间偏移，确保初始执行时间大约在 01:30 (UTC+8) 左右
-  const OFFSET = 61800000; 
+  // 默认基准时间戳: 2024-01-01 01:30:00 (UTC+8) -> 兼容未设置变量的情况
+  let anchorMs = 1704043800000; 
+
+  if (env && env.START_TIME) {
+    try {
+      // 期望格式: "2024-08-10 01:30" 
+      // 替换空格为T并加上东八区时区，变成 ISO 8601 格式 "2024-08-10T01:30:00+08:00"
+      const timeStr = env.START_TIME.trim().replace(/\s+/, 'T') + ':00+08:00';
+      const parsed = Date.parse(timeStr);
+      if (!isNaN(parsed)) {
+        anchorMs = parsed;
+      } else {
+        console.error("START_TIME 变量格式解析失败，请检查是否为 YYYY-MM-DD HH:mm 格式");
+      }
+    } catch (e) {
+      console.error("START_TIME 解析异常", e);
+    }
+  }
+
   const nowMs = Date.now();
 
-  // 计算已经过了多少个完整的周期
-  const elapsedCycles = Math.floor((nowMs - OFFSET) / CYCLE_MS);
+  // 计算从基准时间起，已经过了多少个完整的 24小时5分钟 周期
+  const elapsedCycles = Math.floor((nowMs - anchorMs) / CYCLE_MS);
   
-  // 当前周期的目标执行时间（今天）
-  const currentTargetMs = OFFSET + elapsedCycles * CYCLE_MS;
-  // 下个周期的目标执行时间（明天）
+  // 当前周期的目标执行时间（今天预计执行的时间）
+  const currentTargetMs = anchorMs + elapsedCycles * CYCLE_MS;
+  // 下个周期的目标执行时间（明天预计执行的时间）
   const nextTargetMs = currentTargetMs + CYCLE_MS;
 
   // 允许 Cron 有极小误差，判定窗口为 [-1分钟, +5分钟]
@@ -137,7 +155,7 @@ async function checkAndAutoRestart(env) {
 // ==================== 主入口 ====================
 async function main(env, mode = 'renew', targetAccount = null) {
   console.log(`开始执行 PellaFree ${mode === 'renew' ? '自动续期' : '重启'}...`);
-  const schedule = getScheduleInfo(); 
+  const schedule = getScheduleInfo(env); 
   const accounts = parseAccounts(env.ACCOUNT);
   
   if (accounts.length === 0) {
@@ -377,7 +395,6 @@ function formatNotification(result, mode, schedule) {
   }
   lines.push('');
 
-  // 新增的定时时间通知模块
   if (mode === 'renew' && schedule) {
     lines.push(`🕒 本次计划: ${schedule.todayTimeStr}`);
     lines.push(`🕒 下次计划: ${schedule.tomorrowTimeStr}`);
