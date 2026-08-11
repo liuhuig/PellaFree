@@ -2,6 +2,8 @@
 
 动动发财手点点 Star ⭐
 
+本项目是根据oyz8/PellaFree的项目进行改进，增加延迟续期和隧道监控。
+
 基于 Cloudflare Workers 部署的 **PellaFree 自动续期 + 隧道监控自动重启面板**
 
 ## 📌 功能说明
