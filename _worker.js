@@ -1,4 +1,4 @@
-// _worker.js - PellaFree 自动续期 + 隧道异常自动重启面板
+// _worker.js - PellaFree-pro 自动续期 + 隧道异常自动重启面板
 
 export default {
   async fetch(request, env, ctx) {
