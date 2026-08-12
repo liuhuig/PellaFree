@@ -144,7 +144,7 @@ async function checkAndAutoRestart(env) {
   if (hasError) {
     console.log(`检测到隧道异常: ${failedDomains.join(', ')}，触发自动重启...`);
     if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
-      await sendTG(env, `⚠️ 隧道异常自动重启\n\n🌐 异常域名: ${failedDomains.join(', ')}\n🔄 正在通过底层 API 触发全账号重启...\n\nPellaFree Monitor`);
+      await sendTG(env, `⚠️ 隧道异常自动重启\n\n🌐 异常域名: ${failedDomains.join(', ')}\n🔄 正在通过底层 API 触发全账号重启...\n\nPellaFree-pro Monitor`);
     }
     await main(env, 'restart', null); 
   } else {
@@ -161,7 +161,7 @@ async function main(env, mode = 'renew', targetAccount = null) {
   if (accounts.length === 0) {
     console.log('未找到有效账号');
     if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
-      await sendTG(env, `⚠️ PellaFree ${mode === 'renew' ? '续期' : '重启'}\n\n未找到有效账号，请检查 ACCOUNT 变量\n\nPellaFree Auto Renewal`);
+      await sendTG(env, `⚠️ PellaFree ${mode === 'renew' ? '续期' : '重启'}\n\n未找到有效账号，请检查 ACCOUNT 变量\n\nPellaFree-pro Auto Renewal`);
     }
     return;
   }
@@ -169,7 +169,7 @@ async function main(env, mode = 'renew', targetAccount = null) {
   const targetAccounts = targetAccount ? accounts.filter(a => a.email.toLowerCase() === targetAccount.toLowerCase()) : accounts;
   if (targetAccounts.length === 0 && targetAccount) {
     if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
-      await sendTG(env, `⚠️ PellaFree ${mode === 'renew' ? '续期' : '重启'}\n\n未找到账号: ${targetAccount}\n请检查 ACCOUNT 变量\n\nPellaFree Auto Renewal`);
+      await sendTG(env, `⚠️ PellaFree ${mode === 'renew' ? '续期' : '重启'}\n\n未找到账号: ${targetAccount}\n请检查 ACCOUNT 变量\n\nPellaFree-pro Auto Renewal`);
     }
     return;
   }
@@ -406,7 +406,7 @@ function formatNotification(result, mode, schedule) {
   if (result.error) {
     lines.push(`❌ 错误: ${escapeHtml(result.error)}`);
     lines.push('');
-    lines.push('PellaFree Auto Renewal');
+    lines.push('PellaFree-pro Auto Renewal');
     return lines.join('\n');
   }
 
@@ -462,7 +462,7 @@ function formatNotification(result, mode, schedule) {
   }
 
   lines.push('');
-  lines.push('PellaFree Auto Renewal');
+  lines.push('PellaFree-pro Auto Renewal');
   return lines.join('\n');
 }
 
@@ -726,7 +726,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <body>
 <div class="container">
 <div class="logo">
-<h1>🚀 PellaFree</h1>
+<h1>🚀 PellaFree pro</h1>
 <p>自动续期 & 重启管理面板</p>
 </div>
 <div class="input-group">
